@@ -28,52 +28,36 @@ Normal read paths are prefix-based. Normal write paths create immutable objects
 or append new reference/state objects. Updates are represented by new objects
 instead of mutating message bodies.
 
-## Planned Directory Structure
+## Implemented Directory Structure
 
 ```text
 Agent.md
+go.mod
+cmd/
+  s3-message-service/
 docs/
   ARCHITECTURE.md
   SPEC.md
   BUILD.md
   EXTERNAL_DOCS.md
   nextsession.md
-src/
-  entrypoints/
-    http/
-    workers/
+internal/
   application/
-    usecases/
-    repair/
   config/
   core/
-    identifiers/
     cursors/
-    serialization/
-    validation/
-  modules/
-    messages/
-    mailboxes/
-    threads/
-    broadcasts/
-    states/
-    attachments/
-    operations/
-  storage/
-    ports/
-    adapters/
+    ids/
     keys/
-  shared/
-    errors/
-    result/
-    observability/
-  types/
-tests/
-scripts/
+  domain/
+  httpapi/
+  storage/
+    localfs/
 ```
 
-This is a target structure for future implementation. The current repository
-contains documentation only.
+The first implementation uses Go's `cmd/` and `internal/` layout. The
+architecture still follows the same module boundaries: HTTP entrypoint,
+application use cases, core cursor/key/identifier helpers, domain types, and a
+provider-neutral storage port with a filesystem adapter for local development.
 
 ## Module Breakdown
 

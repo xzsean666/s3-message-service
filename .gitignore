@@ -1,0 +1,4 @@
+.env
+.s3-message-data/
+bin/
+coverage.out

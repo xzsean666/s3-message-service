@@ -1,127 +1,96 @@
 # Next Session Handoff
 
-Current step: Step 3 - Context Handoff
+Current step: Step 4 - Implementation
 
 Last updated: 2026-06-01
 
 ## Current Progress
 
-The repository is initialized and currently contains documentation only.
-No implementation code has been written.
+The repository now contains a Go implementation of Async Messaging Service.
+The service is runnable as an HTTP API and persists all durable data through a
+provider-neutral object storage port. The current adapter is filesystem-backed
+for local development and tests.
 
-Completed commits:
+Completed commits before this implementation:
 
 - `fe969b4` - `feat: add architecture design docs`
 - `2baa796` - `feat: add messaging service documentation`
+- `5a34cbd` - `feat: add next session handoff`
+- `499724e` - `feat: refine architecture design`
 
-## Architecture Summary
+## Implemented Runtime And Layout
 
-Async Messaging Service is an independent asynchronous messaging capability
-service.
+Runtime: Go.
 
-Core architecture:
+Main layout:
 
-- Object storage is the only persistent layer.
-- Messages are immutable after creation.
-- Mailboxes, threads, broadcasts, states, and attachments are organized by
-  object prefixes.
-- Mailbox and thread reads use small reference objects pointing to immutable
-  message bodies.
-- Broadcast message bodies are stored once and referenced or resolved through
-  audience descriptors.
-- Read state is stored independently from messages.
-- Provider-specific logic stays behind storage adapters.
-- External systems own actors, authorization, tag membership, and business
-  workflows.
+- `cmd/s3-message-service` - service executable.
+- `internal/application` - use cases for messages, mailboxes, threads,
+  broadcasts, read state, attachments, idempotency, and operation records.
+- `internal/config` - environment-based runtime configuration.
+- `internal/core/cursors` - opaque prefix-window cursor encoding.
+- `internal/core/ids` - UUIDv7 identifier generation.
+- `internal/core/keys` - centralized object key builder and normalization.
+- `internal/domain` - stored JSON object types.
+- `internal/httpapi` - HTTP entrypoint.
+- `internal/storage` - provider-neutral object store port.
+- `internal/storage/localfs` - filesystem object store adapter for local use.
 
-Primary planned modules:
+## Implemented Capabilities
 
-- Entry points.
-- Configuration.
-- Identifier generation.
-- Validation.
-- Message module.
-- Mailbox module.
-- Thread module.
-- Broadcast module.
-- State module.
-- Attachment module.
-- Storage port.
-- Storage adapters.
-- Object key builder.
-- Serialization.
+- Send actor messages.
+- Store immutable message bodies.
+- Write direct lookup references for identifier-only reads.
+- Write sender `sent` and recipient `inbox` mailbox references.
+- Create and list thread references.
+- List mailbox pages with prefix-window cursors and reverse-time feed keys.
+- Mark messages and threads as read with append-only state events and current
+  state projection.
+- Create attachment metadata and lookup references.
+- Send and retrieve broadcasts with audience descriptors.
+- Use caller-scoped idempotency keys for retry-safe write operations.
+- Record operation start, step, and completion objects.
+- Run an HTTP API with health check.
+- Run unit tests for key builder, cursor encoding, local storage, application
+  behavior, and HTTP message flow.
 
-## Completed Parts
+## Build And Run
 
-- Root `Agent.md` normalized for future AI agent behavior.
-- `docs/ARCHITECTURE.md` created with architecture, module breakdown, data flow,
-  and key design decisions.
-- `docs/SPEC.md` created with system boundaries, storage model, domain object
-  requirements, conceptual API surface, provider capability requirements, and
-  non-goals.
-- `docs/BUILD.md` created with current documentation-only usage and future build
-  workflow.
-- `docs/EXTERNAL_DOCS.md` created with official provider and standards links.
+Run tests:
 
-## Pending Tasks
+```bash
+go test ./...
+```
 
-1. Ask the user whether Step 4 implementation is approved.
-2. Choose implementation runtime before writing code.
-3. Update `docs/BUILD.md` with the selected runtime and commands.
-4. Define provider capability matrix for AWS S3, Cloudflare R2, Backblaze B2,
-   and MinIO.
-5. Implement centralized configuration.
-6. Implement storage port contracts.
-7. Implement object key builder.
-8. Implement identifier and identifier parsing utilities.
-9. Implement serialization and schema versioning.
-10. Implement message use cases.
-11. Implement mailbox reference use cases.
-12. Implement thread use cases.
-13. Implement broadcast use cases.
-14. Implement state use cases.
-15. Implement attachment metadata and upload workflow.
-16. Add unit and contract tests incrementally.
-17. Add local S3-compatible integration testing.
+Run locally:
 
-## Next Actions
+```bash
+S3MS_STORAGE_PROVIDER=filesystem \
+S3MS_FILESYSTEM_ROOT=.s3-message-data \
+S3MS_HTTP_ADDR=:8080 \
+go run ./cmd/s3-message-service
+```
 
-Recommended next session flow:
+## Remaining Follow-Up Work
 
-1. Read `Agent.md`.
-2. Read `docs/ARCHITECTURE.md`.
-3. Read `docs/SPEC.md`.
-4. Read `docs/EXTERNAL_DOCS.md`.
-5. Confirm whether the user wants Step 4 implementation.
-6. If approved, choose TypeScript or Go explicitly before creating source code.
-7. Start with configuration, storage port, and object key builder because later
-   modules depend on them.
+1. Add an S3-compatible SDK adapter behind `internal/storage.ObjectStore`.
+2. Add MinIO integration tests for the future S3 adapter.
+3. Add provider capability matrix for AWS S3, Cloudflare R2, Backblaze B2, and
+   MinIO.
+4. Add list-broadcast read use case that merges all/tag audiences with actor
+   context.
+5. Add lifecycle event use cases for correction, soft deletion, and moderation
+   status when product requirements are known.
+6. Add structured logging and request identifiers around HTTP handlers.
+7. Add API contract examples or OpenAPI after the endpoint shape stabilizes.
 
 ## Risks And Unknowns
 
-- Runtime is not selected.
-- API transport is not selected.
-- Exact deployment target is not selected.
-- Provider-specific conditional write behavior must be verified during adapter
-  implementation.
-- Newest-first mailbox pagination needs careful design because object storage
-  listing is naturally prefix and lexicographic based.
-- Tag broadcast semantics depend on an external actor or tag system that has not
-  been specified.
-- Authorization is out of scope, but callers still need a trusted integration
-  boundary.
-- Read-state compaction or materialized current state may be needed later for
-  high-volume actors, but V1 should remain append-only.
-
-## Implementation Guard
-
-Do not write code until the user explicitly approves Step 4.
-
-If implementation begins, preserve these constraints:
-
-- No database dependency.
-- No hidden provider-specific behavior in domain modules.
-- No full-bucket scans for normal reads.
-- No mutable message body updates.
-- No user, login, authorization, tag-management, push, search, or real-time
-  presence features inside this service.
+- Current storage adapter is filesystem-only. The core is provider-neutral, but
+  production object storage still needs an S3-compatible adapter.
+- Authorization remains intentionally out of scope. Callers must be trusted by
+  deployment configuration.
+- Current state projection uses overwrite semantics as an optimization. The
+  append-only state event remains the source of truth.
+- Operation repair records exist, but no background repair worker has been
+  implemented yet.
