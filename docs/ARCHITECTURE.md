@@ -32,32 +32,34 @@ instead of mutating message bodies.
 
 ```text
 Agent.md
-go.mod
-cmd/
-  s3-message-service/
+Cargo.toml
 docs/
   ARCHITECTURE.md
   SPEC.md
   BUILD.md
   EXTERNAL_DOCS.md
   nextsession.md
-internal/
-  application/
-  config/
-  core/
-    cursors/
-    ids/
-    keys/
-  domain/
-  httpapi/
+src/
+  application.rs
+  config.rs
+  cursors.rs
+  domain.rs
+  error.rs
+  httpapi.rs
+  ids.rs
+  keys.rs
+  lib.rs
+  main.rs
   storage/
-    localfs/
+    mod.rs
+    b2.rs
+    localfs.rs
 ```
 
-The first implementation uses Go's `cmd/` and `internal/` layout. The
-architecture still follows the same module boundaries: HTTP entrypoint,
-application use cases, core cursor/key/identifier helpers, domain types, and a
-provider-neutral storage port with a filesystem adapter for local development.
+The current implementation uses a Rust `src/` layout. The architecture still
+follows the same module boundaries: HTTP entrypoint, application use cases, core
+cursor/key/identifier helpers, domain types, and a provider-neutral storage port
+with filesystem and Backblaze B2 S3-compatible adapters.
 
 ## Module Breakdown
 

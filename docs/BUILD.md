@@ -2,8 +2,8 @@
 
 Current step: Step 4 - Implementation
 
-The repository now contains a Go implementation of Async Messaging Service.
-The first implementation uses a provider-neutral object storage port and a local
+The repository now contains a Rust implementation of Async Messaging Service.
+The implementation uses a provider-neutral object storage port and a local
 filesystem adapter for development and tests. S3-compatible adapters can be
 added behind the same port without changing application or domain modules.
 
@@ -28,14 +28,14 @@ find . -maxdepth 3 -type f | sort
 
 ## Runtime Decision
 
-The selected runtime is Go.
+The selected runtime is Rust.
 
 Reasons:
 
 - Produces a small stateless service binary.
-- Uses the standard library for HTTP, JSON, filesystem-backed local storage, and
-  tests.
-- Keeps module boundaries explicit and easy to audit.
+- Provides explicit domain, storage, and HTTP boundaries with strong typing.
+- Uses Tokio and Axum for the HTTP service while keeping object-storage behavior
+  behind a provider-neutral port.
 - Can add S3-compatible SDK adapters later behind the existing storage port.
 
 ## Build, Test, And Run
@@ -43,13 +43,13 @@ Reasons:
 Run all tests:
 
 ```bash
-go test ./...
+cargo test
 ```
 
 Build the service:
 
 ```bash
-go build ./cmd/s3-message-service
+cargo build
 ```
 
 Run locally with filesystem object storage:
@@ -58,7 +58,7 @@ Run locally with filesystem object storage:
 S3MS_STORAGE_PROVIDER=filesystem \
 S3MS_FILESYSTEM_ROOT=.s3-message-data \
 S3MS_HTTP_ADDR=:8080 \
-go run ./cmd/s3-message-service
+cargo run
 ```
 
 Health check:
@@ -66,6 +66,30 @@ Health check:
 ```bash
 curl http://localhost:8080/healthz
 ```
+
+Run locally with Backblaze B2 S3-compatible storage:
+
+```bash
+set -a
+. ./.env.test
+set +a
+S3MS_STORAGE_PROVIDER=b2 cargo run
+```
+
+Run the real B2 end-to-end test:
+
+```bash
+cargo test --test b2_e2e -- --ignored --nocapture
+```
+
+The B2 e2e test is ignored by default because it writes to a real bucket. It
+loads `.env.test`, creates a unique object namespace, covers storage operations,
+messages, mailboxes, threads, read state, attachments, broadcasts, and then
+cleans up that namespace.
+
+The B2 adapter emulates create-if-absent writes with `HEAD` before `PUT` because
+the tested B2 S3-compatible endpoint does not accept the `If-None-Match: *`
+conditional write header.
 
 ## Development Workflow
 
@@ -90,18 +114,20 @@ Do not push unless explicitly requested.
 Current source layout:
 
 ```text
-cmd/s3-message-service/
-internal/
-  application/
-  config/
-  core/
-    cursors/
-    ids/
-    keys/
-  domain/
-  httpapi/
+src/
+  application.rs
+  config.rs
+  cursors.rs
+  domain.rs
+  error.rs
+  httpapi.rs
+  ids.rs
+  keys.rs
+  lib.rs
+  main.rs
   storage/
-    localfs/
+    mod.rs
+    localfs.rs
 ```
 
 The local filesystem adapter stores objects as files under
@@ -120,6 +146,14 @@ Expected settings:
 - `S3MS_MAX_PAGE_SIZE`: maximum API page size, default `100`.
 - `S3MS_READ_LOOKBACK_MINUTES`: max cursor windows for newest-first reads,
   default `43200`.
+- `B2_BUCKET_NAME`: Backblaze B2 bucket name when `S3MS_STORAGE_PROVIDER=b2`.
+- `B2_APPLICATION_KEY_ID`: Backblaze B2 application key identifier.
+- `B2_APPLICATION_KEY`: Backblaze B2 application key secret.
+- `B2_S3_ENDPOINT`: optional S3 endpoint override. When omitted, the service
+  calls B2 authorization and uses the returned `s3ApiUrl`.
+- `B2_S3_REGION`: optional region override. When omitted, the region is inferred
+  from the B2 S3 endpoint host.
+- `B2_TEST_PREFIX`: optional object prefix base for the real e2e test.
 
 Secrets must not be committed.
 

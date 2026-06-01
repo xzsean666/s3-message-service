@@ -2,3 +2,5 @@
 .s3-message-data/
 bin/
 coverage.out
+target/
+.env.test

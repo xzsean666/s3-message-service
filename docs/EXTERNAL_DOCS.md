@@ -34,6 +34,7 @@ links before changing provider adapters or storage behavior.
 ### Backblaze B2
 
 - Developer docs: https://www.backblaze.com/docs
+- B2 authorize account: https://www.backblaze.com/apidocs/b2-authorize-account
 - S3-compatible API: https://www.backblaze.com/docs/en/cloud-storage-call-the-s3-compatible-api
 - Connect to Backblaze B2: https://www.backblaze.com/docs/cloud-storage-connect-to-backblaze-b2
 

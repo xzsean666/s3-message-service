@@ -1,0 +1,27 @@
+[package]
+name = "s3-message-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+aws-config = "1"
+aws-credential-types = "1"
+aws-sdk-s3 = "1"
+aws-types = "1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+dotenvy = "0.15"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

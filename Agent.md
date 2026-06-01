@@ -99,28 +99,24 @@ business workflows, and tag membership.
 - Do not mix authentication or authorization into this service.
 - Do not create "god" utility files.
 
-## Preferred Future Directory Shape
+## Current Implementation Directory Shape
 
-Implementation has not started. When Step 4 is approved, prefer this shape unless
-new requirements make another structure clearly better:
+The current Step 4 implementation is Rust and uses this shape:
 
 ```text
 src/
-  entrypoints/
-  config/
-  core/
-  modules/
-    messages/
-    mailboxes/
-    threads/
-    broadcasts/
-    states/
-    attachments/
+  application.rs
+  config.rs
+  cursors.rs
+  domain.rs
+  error.rs
+  httpapi.rs
+  ids.rs
+  keys.rs
+  lib.rs
+  main.rs
   storage/
-    ports/
-    adapters/
-  shared/
-  types/
-tests/
-scripts/
+    mod.rs
+    b2.rs
+    localfs.rs
 ```
