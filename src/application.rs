@@ -1,10 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::cursors::{self, Cursor, Direction};
 use crate::domain::{
@@ -17,6 +20,8 @@ use crate::keys::{KeyBuilder, normalize_external_id};
 use crate::storage::{ListInput, ObjectStore, PutOptions};
 
 const DEFAULT_CALLER_ID: &str = "default";
+const HYDRATION_CONCURRENCY: usize = 8;
+const IDEMPOTENCY_LOCK_SHARDS: usize = 64;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
@@ -27,6 +32,8 @@ pub struct Service {
     clock: Clock,
     max_page_size: usize,
     read_lookback_minutes: usize,
+    non_atomic_create_lock: Arc<AsyncMutex<()>>,
+    idempotency_locks: Vec<Arc<AsyncMutex<()>>>,
 }
 
 pub struct ServiceOptions {
@@ -58,12 +65,19 @@ impl Service {
             clock: options.clock.unwrap_or_else(|| Arc::new(Utc::now)),
             max_page_size,
             read_lookback_minutes,
+            non_atomic_create_lock: Arc::new(AsyncMutex::new(())),
+            idempotency_locks: (0..IDEMPOTENCY_LOCK_SHARDS)
+                .map(|_| Arc::new(AsyncMutex::new(())))
+                .collect(),
         }
     }
 
     pub async fn send_message(&self, command: SendMessageCommand) -> Result<SendMessageResult> {
         validate_send_message(&command)?;
         let caller_id = caller_or_default(&command.caller_id);
+        let _idempotency_guard = self
+            .lock_idempotency(&caller_id, &command.idempotency_key)
+            .await;
         let mut created_at = self.now();
         let entity_ids = self.message_entity_ids(&command)?;
         let (operation, completed) = self
@@ -260,18 +274,21 @@ impl Service {
             })
             .await?;
 
-        let mut items = Vec::with_capacity(references.len());
-        for reference in references {
-            let message = self.get_message(&reference.message_object_key).await?;
-            let read_state = self
-                .get_current_state(actor_id, "messages", &reference.message_id)
-                .await;
-            items.push(MailboxItem {
-                reference,
-                message,
-                read_state,
-            });
-        }
+        let items = stream::iter(references)
+            .map(|reference| async move {
+                let message = self.get_message(&reference.message_object_key).await?;
+                let read_state = self
+                    .get_current_state(actor_id, "messages", &reference.message_id)
+                    .await?;
+                Ok::<MailboxItem, ServiceError>(MailboxItem {
+                    reference,
+                    message,
+                    read_state,
+                })
+            })
+            .buffered(HYDRATION_CONCURRENCY)
+            .try_collect()
+            .await?;
         Ok(ListMailboxResult { items, next_cursor })
     }
 
@@ -303,15 +320,19 @@ impl Service {
                 self.key_builder.thread_prefix(thread_id, window)
             })
             .await?;
-        let mut items = Vec::with_capacity(references.len());
-        for reference in references {
-            let message = self.get_message(&reference.message_object_key).await?;
-            items.push(ThreadItem { reference, message });
-        }
+        let items = stream::iter(references)
+            .map(|reference| async move {
+                let message = self.get_message(&reference.message_object_key).await?;
+                Ok::<ThreadItem, ServiceError>(ThreadItem { reference, message })
+            })
+            .buffered(HYDRATION_CONCURRENCY)
+            .try_collect()
+            .await?;
         let read_state = if actor_id.is_empty() {
             None
         } else {
-            self.get_current_state(actor_id, "threads", thread_id).await
+            self.get_current_state(actor_id, "threads", thread_id)
+                .await?
         };
         Ok(ListThreadResult {
             thread,
@@ -327,6 +348,9 @@ impl Service {
     ) -> Result<SendBroadcastResult> {
         validate_send_broadcast(&command)?;
         let caller_id = caller_or_default(&command.caller_id);
+        let _idempotency_guard = self
+            .lock_idempotency(&caller_id, &command.idempotency_key)
+            .await;
         let mut created_at = self.now();
         let mut entity_ids = HashMap::new();
         entity_ids.insert("broadcastId".to_string(), self.id_generator.new_id()?);
@@ -421,6 +445,9 @@ impl Service {
     pub async fn mark_read(&self, command: MarkReadCommand) -> Result<MarkReadResult> {
         validate_mark_read(&command)?;
         let caller_id = caller_or_default(&command.caller_id);
+        let _idempotency_guard = self
+            .lock_idempotency(&caller_id, &command.idempotency_key)
+            .await;
         let mut created_at = self.now();
         let read_at = command.read_at.unwrap_or(created_at).with_timezone(&Utc);
         let mut entity_ids = HashMap::new();
@@ -464,7 +491,7 @@ impl Service {
         );
         let existing = self
             .get_current_state(&command.actor_id, &command.target_kind, &command.target_id)
-            .await;
+            .await?;
         if existing
             .as_ref()
             .map(|existing| existing.read_at <= state.read_at)
@@ -492,6 +519,9 @@ impl Service {
     ) -> Result<CreateAttachmentResult> {
         validate_create_attachment(&command)?;
         let caller_id = caller_or_default(&command.caller_id);
+        let _idempotency_guard = self
+            .lock_idempotency(&caller_id, &command.idempotency_key)
+            .await;
         let mut created_at = self.now();
         let mut entity_ids = HashMap::new();
         entity_ids.insert("attachmentId".to_string(), self.id_generator.new_id()?);
@@ -573,6 +603,22 @@ impl Service {
 
     fn now(&self) -> DateTime<Utc> {
         (self.clock)().with_timezone(&Utc)
+    }
+
+    async fn lock_idempotency(
+        &self,
+        caller_id: &str,
+        idempotency_key: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let idempotency_key = idempotency_key.trim();
+        if idempotency_key.is_empty() {
+            return None;
+        }
+        let mut hasher = DefaultHasher::new();
+        caller_id.hash(&mut hasher);
+        idempotency_key.hash(&mut hasher);
+        let shard = hasher.finish() as usize % self.idempotency_locks.len();
+        Some(self.idempotency_locks[shard].clone().lock_owned().await)
     }
 
     fn message_entity_ids(&self, command: &SendMessageCommand) -> Result<HashMap<String, String>> {
@@ -810,14 +856,19 @@ impl Service {
         actor_id: &str,
         target_kind: &str,
         target_id: &str,
-    ) -> Option<State> {
-        self.get_json(
-            &self
-                .key_builder
-                .state_current(actor_id, target_kind, target_id),
-        )
-        .await
-        .ok()
+    ) -> Result<Option<State>> {
+        match self
+            .get_json(
+                &self
+                    .key_builder
+                    .state_current(actor_id, target_kind, target_id),
+            )
+            .await
+        {
+            Ok(state) => Ok(Some(state)),
+            Err(ServiceError::ObjectNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     async fn put_json_create_only<T: Serialize>(&self, object_key: &str, value: &T) -> Result<()> {
@@ -835,16 +886,15 @@ impl Service {
     ) -> Result<()> {
         let mut data = serde_json::to_vec_pretty(value)?;
         data.push(b'\n');
-        self.store
-            .put(
-                object_key,
-                &data,
-                PutOptions {
-                    create_only,
-                    content_type: "application/json".to_string(),
-                },
-            )
-            .await
+        let options = PutOptions {
+            create_only,
+            content_type: "application/json".to_string(),
+        };
+        if create_only && !self.store.capabilities().create_if_absent_atomic {
+            let _guard = self.non_atomic_create_lock.lock().await;
+            return self.store.put(object_key, &data, options).await;
+        }
+        self.store.put(object_key, &data, options).await
     }
 
     async fn get_json<T: DeserializeOwned>(&self, object_key: &str) -> Result<T> {
@@ -1142,10 +1192,16 @@ fn decode_operation_result<T: DeserializeOwned>(result: Option<Value>) -> Result
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration as StdDuration;
+
+    use async_trait::async_trait;
     use chrono::{Duration, TimeZone};
 
     use super::*;
     use crate::storage::localfs::LocalFileStore;
+    use crate::storage::{ListPage, ListedObject, ObjectInfo, StoreCapabilities};
 
     #[tokio::test]
     async fn message_mailbox_thread_state_attachment_and_broadcast() {
@@ -1297,18 +1353,179 @@ mod tests {
         assert_eq!(second_page.items.len(), 1);
     }
 
+    #[tokio::test]
+    async fn non_atomic_store_create_only_writes_are_serialized() {
+        let fixed_now = Utc.with_ymd_and_hms(2026, 6, 1, 11, 22, 33).unwrap();
+        let store = Arc::new(InstrumentedNonAtomicStore::default());
+        let service = new_service_with_store(store.clone(), fixed_now);
+
+        let left_command = SendMessageCommand {
+            sender_actor_id: "actor-a".to_string(),
+            recipient_actor_ids: vec!["actor-b".to_string()],
+            message_type: "text".to_string(),
+            payload: Some(json!({"text": "left"})),
+            ..Default::default()
+        };
+        let right_command = SendMessageCommand {
+            sender_actor_id: "actor-c".to_string(),
+            recipient_actor_ids: vec!["actor-d".to_string()],
+            message_type: "text".to_string(),
+            payload: Some(json!({"text": "right"})),
+            ..Default::default()
+        };
+
+        let (left, right) = tokio::join!(
+            service.send_message(left_command),
+            service.send_message(right_command)
+        );
+        left.expect("left send");
+        right.expect("right send");
+        assert_eq!(store.max_active_create_only.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_idempotent_requests_share_completed_result() {
+        let fixed_now = Utc.with_ymd_and_hms(2026, 6, 1, 11, 22, 33).unwrap();
+        let store = Arc::new(InstrumentedNonAtomicStore::default());
+        let service = new_service_with_store(store, fixed_now);
+        let command = SendMessageCommand {
+            caller_id: "tests".to_string(),
+            idempotency_key: "same-message".to_string(),
+            sender_actor_id: "actor-a".to_string(),
+            recipient_actor_ids: vec!["actor-b".to_string()],
+            message_type: "text".to_string(),
+            payload: Some(json!({"text": "hello"})),
+            create_thread: true,
+            ..Default::default()
+        };
+
+        let (left, right) = tokio::join!(
+            service.send_message(command.clone()),
+            service.send_message(command)
+        );
+        let left = left.expect("left send");
+        let right = right.expect("right send");
+
+        assert_eq!(left.message_id, right.message_id);
+        assert_eq!(left.thread_id, right.thread_id);
+    }
+
     fn new_test_service(now: DateTime<Utc>) -> (tempfile::TempDir, Service) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileStore::new(temp_dir.path()).expect("store"));
-        let service = Service::new(ServiceOptions {
+        let service = new_service_with_store(store, now);
+        (temp_dir, service)
+    }
+
+    fn new_service_with_store(store: Arc<dyn ObjectStore>, now: DateTime<Utc>) -> Service {
+        Service::new(ServiceOptions {
             store,
             key_builder: KeyBuilder::new(""),
             id_generator: IdGenerator::new(),
             clock: Some(Arc::new(move || now)),
             max_page_size: 50,
             read_lookback_minutes: 120,
-        });
-        (temp_dir, service)
+        })
+    }
+
+    #[derive(Default)]
+    struct InstrumentedNonAtomicStore {
+        objects: StdMutex<HashMap<String, Vec<u8>>>,
+        active_create_only: AtomicUsize,
+        max_active_create_only: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ObjectStore for InstrumentedNonAtomicStore {
+        fn capabilities(&self) -> StoreCapabilities {
+            StoreCapabilities {
+                create_if_absent_atomic: false,
+            }
+        }
+
+        async fn put(&self, key: &str, data: &[u8], options: PutOptions) -> Result<()> {
+            if options.create_only {
+                let active = self.active_create_only.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active_create_only
+                    .fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(StdDuration::from_millis(10)).await;
+            }
+
+            let result = {
+                let mut objects = self.objects.lock().expect("objects lock poisoned");
+                if options.create_only && objects.contains_key(key) {
+                    Err(ServiceError::ObjectAlreadyExists)
+                } else {
+                    objects.insert(key.to_string(), data.to_vec());
+                    Ok(())
+                }
+            };
+
+            if options.create_only {
+                self.active_create_only.fetch_sub(1, Ordering::SeqCst);
+            }
+            result
+        }
+
+        async fn get(&self, key: &str) -> Result<Vec<u8>> {
+            self.objects
+                .lock()
+                .expect("objects lock poisoned")
+                .get(key)
+                .cloned()
+                .ok_or(ServiceError::ObjectNotFound)
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectInfo> {
+            let objects = self.objects.lock().expect("objects lock poisoned");
+            let data = objects.get(key).ok_or(ServiceError::ObjectNotFound)?;
+            Ok(ObjectInfo {
+                key: key.to_string(),
+                size: data.len() as u64,
+                content_type: String::new(),
+                modified_at: Utc::now(),
+            })
+        }
+
+        async fn list(&self, mut input: ListInput) -> Result<ListPage> {
+            if input.limit == 0 {
+                input.limit = 100;
+            }
+            let objects = self.objects.lock().expect("objects lock poisoned");
+            let mut listed = objects
+                .iter()
+                .filter(|(key, _)| key.starts_with(&input.prefix))
+                .filter(|(key, _)| input.start_after.is_empty() || *key > &input.start_after)
+                .map(|(key, data)| ListedObject {
+                    key: key.clone(),
+                    size: data.len() as u64,
+                    modified_at: Utc::now(),
+                })
+                .collect::<Vec<_>>();
+            listed.sort_by(|left, right| left.key.cmp(&right.key));
+            let has_more = listed.len() > input.limit;
+            if has_more {
+                listed.truncate(input.limit);
+            }
+            let next_after_key = listed
+                .last()
+                .map(|object| object.key.clone())
+                .unwrap_or_default();
+            Ok(ListPage {
+                objects: listed,
+                has_more,
+                next_after_key,
+            })
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects
+                .lock()
+                .expect("objects lock poisoned")
+                .remove(key)
+                .map(|_| ())
+                .ok_or(ServiceError::ObjectNotFound)
+        }
     }
 }

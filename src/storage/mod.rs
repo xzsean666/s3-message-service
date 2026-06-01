@@ -12,6 +12,19 @@ pub struct PutOptions {
     pub content_type: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoreCapabilities {
+    pub create_if_absent_atomic: bool,
+}
+
+impl Default for StoreCapabilities {
+    fn default() -> Self {
+        Self {
+            create_if_absent_atomic: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectInfo {
     pub key: String,
@@ -43,6 +56,10 @@ pub struct ListPage {
 
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
+    fn capabilities(&self) -> StoreCapabilities {
+        StoreCapabilities::default()
+    }
+
     async fn put(&self, key: &str, data: &[u8], options: PutOptions) -> Result<()>;
     async fn get(&self, key: &str) -> Result<Vec<u8>>;
     async fn head(&self, key: &str) -> Result<ObjectInfo>;

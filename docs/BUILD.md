@@ -89,7 +89,10 @@ cleans up that namespace.
 
 The B2 adapter emulates create-if-absent writes with `HEAD` before `PUT` because
 the tested B2 S3-compatible endpoint does not accept the `If-None-Match: *`
-conditional write header.
+conditional write header. The service serializes create-only writes in-process
+for stores that report non-atomic create-if-absent behavior; this avoids
+same-process races but is not a distributed lock across multiple service
+instances.
 
 ## Development Workflow
 

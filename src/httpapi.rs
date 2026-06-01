@@ -40,7 +40,7 @@ async fn handle_health() -> Response {
 async fn handle_send_message(State(service): State<Arc<Service>>, body: Bytes) -> Response {
     let command = match decode_json::<SendMessageCommand>(&body) {
         Ok(command) => command,
-        Err(response) => return response,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, error),
     };
     match service.send_message(command).await {
         Ok(result) => json_response(StatusCode::CREATED, result),
@@ -94,7 +94,7 @@ async fn handle_list_thread(
 async fn handle_send_broadcast(State(service): State<Arc<Service>>, body: Bytes) -> Response {
     let command = match decode_json::<SendBroadcastCommand>(&body) {
         Ok(command) => command,
-        Err(response) => return response,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, error),
     };
     match service.send_broadcast(command).await {
         Ok(result) => json_response(StatusCode::CREATED, result),
@@ -115,7 +115,7 @@ async fn handle_get_broadcast(
 async fn handle_mark_read(State(service): State<Arc<Service>>, body: Bytes) -> Response {
     let command = match decode_json::<MarkReadCommand>(&body) {
         Ok(command) => command,
-        Err(response) => return response,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, error),
     };
     match service.mark_read(command).await {
         Ok(result) => json_response(StatusCode::CREATED, result),
@@ -126,7 +126,7 @@ async fn handle_mark_read(State(service): State<Arc<Service>>, body: Bytes) -> R
 async fn handle_create_attachment(State(service): State<Arc<Service>>, body: Bytes) -> Response {
     let command = match decode_json::<CreateAttachmentCommand>(&body) {
         Ok(command) => command,
-        Err(response) => return response,
+        Err(error) => return json_response(StatusCode::BAD_REQUEST, error),
     };
     match service.create_attachment(command).await {
         Ok(result) => json_response(StatusCode::CREATED, result),
@@ -144,9 +144,8 @@ async fn handle_get_attachment(
     }
 }
 
-fn decode_json<T: DeserializeOwned>(body: &[u8]) -> std::result::Result<T, Response> {
-    serde_json::from_slice(body)
-        .map_err(|error| json_response(StatusCode::BAD_REQUEST, error_body("bad_request", error)))
+fn decode_json<T: DeserializeOwned>(body: &[u8]) -> std::result::Result<T, ErrorBody> {
+    serde_json::from_slice(body).map_err(|error| error_body("bad_request", error))
 }
 
 fn parse_limit(query: &HashMap<String, String>) -> usize {
@@ -186,13 +185,23 @@ fn error_response(error: ServiceError) -> Response {
                 message: "object already exists".to_string(),
             },
         ),
-        other => json_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+        ServiceError::InvalidObjectKey => json_response(
+            StatusCode::BAD_REQUEST,
             ErrorBody {
-                error: "internal_error".to_string(),
-                message: other.to_string(),
+                error: "validation_error".to_string(),
+                message: "invalid object key".to_string(),
             },
         ),
+        other => {
+            eprintln!("internal service error: {other:?}");
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                ErrorBody {
+                    error: "internal_error".to_string(),
+                    message: "internal server error".to_string(),
+                },
+            )
+        }
     }
 }
 

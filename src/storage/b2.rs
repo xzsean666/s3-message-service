@@ -9,7 +9,9 @@ use reqwest::Url;
 use serde::Deserialize;
 
 use crate::error::{Result, ServiceError};
-use crate::storage::{ListInput, ListPage, ListedObject, ObjectInfo, ObjectStore, PutOptions};
+use crate::storage::{
+    ListInput, ListPage, ListedObject, ObjectInfo, ObjectStore, PutOptions, StoreCapabilities,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct B2Config {
@@ -88,6 +90,12 @@ impl B2ObjectStore {
 
 #[async_trait]
 impl ObjectStore for B2ObjectStore {
+    fn capabilities(&self) -> StoreCapabilities {
+        StoreCapabilities {
+            create_if_absent_atomic: false,
+        }
+    }
+
     async fn put(&self, key: &str, data: &[u8], options: PutOptions) -> Result<()> {
         validate_object_key(key)?;
         if options.create_only {
@@ -143,7 +151,10 @@ impl ObjectStore for B2ObjectStore {
             key: key.to_string(),
             size: output.content_length().unwrap_or_default().max(0) as u64,
             content_type: output.content_type().unwrap_or_default().to_string(),
-            modified_at: Utc::now(),
+            modified_at: output
+                .last_modified()
+                .map(smithy_datetime_to_chrono)
+                .unwrap_or_else(Utc::now),
         })
     }
 
@@ -170,7 +181,10 @@ impl ObjectStore for B2ObjectStore {
             objects.push(ListedObject {
                 key: key.to_string(),
                 size: object.size().unwrap_or_default().max(0) as u64,
-                modified_at: DateTime::<Utc>::UNIX_EPOCH,
+                modified_at: object
+                    .last_modified()
+                    .map(smithy_datetime_to_chrono)
+                    .unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
             });
         }
         let next_after_key = objects
@@ -195,6 +209,11 @@ impl ObjectStore for B2ObjectStore {
             .map_err(map_s3_error)?;
         Ok(())
     }
+}
+
+fn smithy_datetime_to_chrono(value: &aws_sdk_s3::primitives::DateTime) -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(value.secs(), value.subsec_nanos())
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
 async fn authorize_b2_s3_endpoint(

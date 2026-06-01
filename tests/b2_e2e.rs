@@ -174,7 +174,6 @@ async fn run_e2e(service: &Service, store: &dyn ObjectStore, namespace: &str) ->
             target_id: send_result.thread_id.clone(),
             read_position: send_result.message_id.clone(),
             read_at: Some(Utc::now() + Duration::seconds(2)),
-            ..Default::default()
         })
         .await?;
     assert!(!thread_read_result.state_event_object_key.is_empty());
