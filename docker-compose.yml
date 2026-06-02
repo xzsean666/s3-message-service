@@ -1,0 +1,20 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: s3-message-service:local
+    restart: unless-stopped
+    env_file:
+      - ${S3MS_ENV_FILE:-.env.example}
+    environment:
+      S3MS_HTTP_ADDR: 0.0.0.0:8080
+      S3MS_STORAGE_PROVIDER: ${S3MS_STORAGE_PROVIDER:-filesystem}
+      S3MS_FILESYSTEM_ROOT: ${S3MS_FILESYSTEM_ROOT:-/var/lib/s3-message-service}
+    ports:
+      - "${S3MS_PORT:-8080}:8080"
+    volumes:
+      - app-data:/var/lib/s3-message-service
+
+volumes:
+  app-data:

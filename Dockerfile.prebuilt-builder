@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_IMAGE=rust:1.95-bookworm
+FROM ${RUST_IMAGE} AS builder
+
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+ARG S3MS_CARGO_TARGET=
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    if [ -n "$S3MS_CARGO_TARGET" ]; then \
+        cargo build --release --locked --target "$S3MS_CARGO_TARGET" && \
+        cp "/app/target/$S3MS_CARGO_TARGET/release/s3-message-service" /s3-message-service; \
+    else \
+        cargo build --release --locked && \
+        cp /app/target/release/s3-message-service /s3-message-service; \
+    fi
+
+FROM scratch AS export
+COPY --from=builder /s3-message-service /s3-message-service

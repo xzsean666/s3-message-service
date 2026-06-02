@@ -1,0 +1,12 @@
+.git
+.gitignore
+target
+cache
+out
+data
+tmp
+.s3-message-data
+*.log
+.env
+.env.*
+!.env.example
