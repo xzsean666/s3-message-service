@@ -7,6 +7,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::cursors::{self, Cursor, Direction};
@@ -16,12 +17,13 @@ use crate::domain::{
 };
 use crate::error::{Result, ServiceError};
 use crate::ids::IdGenerator;
-use crate::keys::{KeyBuilder, normalize_external_id};
+use crate::keys::{KeyBuilder, normalize_file_name};
 use crate::storage::{ListInput, ObjectStore, PutOptions};
 
 const DEFAULT_CALLER_ID: &str = "default";
 const HYDRATION_CONCURRENCY: usize = 8;
 const IDEMPOTENCY_LOCK_SHARDS: usize = 64;
+const STATE_LOCK_SHARDS: usize = 64;
 
 pub type Clock = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 
@@ -34,6 +36,7 @@ pub struct Service {
     read_lookback_minutes: usize,
     non_atomic_create_lock: Arc<AsyncMutex<()>>,
     idempotency_locks: Vec<Arc<AsyncMutex<()>>>,
+    state_locks: Vec<Arc<AsyncMutex<()>>>,
 }
 
 pub struct ServiceOptions {
@@ -43,6 +46,11 @@ pub struct ServiceOptions {
     pub clock: Option<Clock>,
     pub max_page_size: usize,
     pub read_lookback_minutes: usize,
+}
+
+struct MessageThreadContext {
+    thread_id: String,
+    parent_message_id: String,
 }
 
 impl Service {
@@ -69,6 +77,9 @@ impl Service {
             idempotency_locks: (0..IDEMPOTENCY_LOCK_SHARDS)
                 .map(|_| Arc::new(AsyncMutex::new(())))
                 .collect(),
+            state_locks: (0..STATE_LOCK_SHARDS)
+                .map(|_| Arc::new(AsyncMutex::new(())))
+                .collect(),
         }
     }
 
@@ -78,10 +89,19 @@ impl Service {
         let _idempotency_guard = self
             .lock_idempotency(&caller_id, &command.idempotency_key)
             .await;
+        let thread_context = self.resolve_message_thread(&command).await?;
+        let request_hash = request_hash("sendMessage", send_message_fingerprint(&command))?;
         let mut created_at = self.now();
-        let entity_ids = self.message_entity_ids(&command)?;
+        let entity_ids = self.message_entity_ids(&command, &thread_context.thread_id)?;
         let (operation, completed) = self
-            .begin_operation(&caller_id, &command.idempotency_key, entity_ids, created_at)
+            .begin_operation(
+                &caller_id,
+                &command.idempotency_key,
+                "sendMessage",
+                &request_hash,
+                entity_ids,
+                created_at,
+            )
             .await?;
         if completed {
             return decode_operation_result(operation.result);
@@ -90,7 +110,7 @@ impl Service {
         let entity_ids = operation.entity_ids.clone();
         created_at = operation.created_at;
         let message_id = required_entity_id(&entity_ids, "messageId")?;
-        let mut thread_id = command.thread_id.clone();
+        let mut thread_id = thread_context.thread_id.clone();
         if thread_id.is_empty() {
             thread_id = entity_ids.get("threadId").cloned().unwrap_or_default();
         }
@@ -105,7 +125,7 @@ impl Service {
             payload: normalized_payload(command.payload.clone()),
             attachment_ids: command.attachment_ids.clone(),
             thread_id: thread_id.clone(),
-            parent_message_id: command.parent_message_id.clone(),
+            parent_message_id: thread_context.parent_message_id.clone(),
             created_at,
         };
         self.put_json_create_only(&message_object_key, &message)
@@ -184,7 +204,11 @@ impl Service {
             let thread = Thread {
                 schema_version: SCHEMA_VERSION,
                 id: thread_id.clone(),
-                root_message_id: message_id.clone(),
+                root_message_id: if thread_context.parent_message_id.is_empty() {
+                    message_id.clone()
+                } else {
+                    thread_context.parent_message_id.clone()
+                },
                 external_correlation_id: String::new(),
                 created_at,
             };
@@ -351,12 +375,20 @@ impl Service {
         let _idempotency_guard = self
             .lock_idempotency(&caller_id, &command.idempotency_key)
             .await;
+        let request_hash = request_hash("sendBroadcast", send_broadcast_fingerprint(&command))?;
         let mut created_at = self.now();
         let mut entity_ids = HashMap::new();
         entity_ids.insert("broadcastId".to_string(), self.id_generator.new_id()?);
 
         let (operation, completed) = self
-            .begin_operation(&caller_id, &command.idempotency_key, entity_ids, created_at)
+            .begin_operation(
+                &caller_id,
+                &command.idempotency_key,
+                "sendBroadcast",
+                &request_hash,
+                entity_ids,
+                created_at,
+            )
             .await?;
         if completed {
             return decode_operation_result(operation.result);
@@ -448,13 +480,21 @@ impl Service {
         let _idempotency_guard = self
             .lock_idempotency(&caller_id, &command.idempotency_key)
             .await;
+        let request_hash = request_hash("markRead", mark_read_fingerprint(&command))?;
         let mut created_at = self.now();
         let read_at = command.read_at.unwrap_or(created_at).with_timezone(&Utc);
         let mut entity_ids = HashMap::new();
         entity_ids.insert("stateId".to_string(), self.id_generator.new_id()?);
 
         let (operation, completed) = self
-            .begin_operation(&caller_id, &command.idempotency_key, entity_ids, created_at)
+            .begin_operation(
+                &caller_id,
+                &command.idempotency_key,
+                "markRead",
+                &request_hash,
+                entity_ids,
+                created_at,
+            )
             .await?;
         if completed {
             return decode_operation_result(operation.result);
@@ -489,6 +529,9 @@ impl Service {
             &command.target_kind,
             &command.target_id,
         );
+        let _state_guard = self
+            .lock_state_projection(&command.actor_id, &command.target_kind, &command.target_id)
+            .await;
         let existing = self
             .get_current_state(&command.actor_id, &command.target_kind, &command.target_id)
             .await?;
@@ -522,12 +565,21 @@ impl Service {
         let _idempotency_guard = self
             .lock_idempotency(&caller_id, &command.idempotency_key)
             .await;
+        let request_hash =
+            request_hash("createAttachment", create_attachment_fingerprint(&command))?;
         let mut created_at = self.now();
         let mut entity_ids = HashMap::new();
         entity_ids.insert("attachmentId".to_string(), self.id_generator.new_id()?);
 
         let (operation, completed) = self
-            .begin_operation(&caller_id, &command.idempotency_key, entity_ids, created_at)
+            .begin_operation(
+                &caller_id,
+                &command.idempotency_key,
+                "createAttachment",
+                &request_hash,
+                entity_ids,
+                created_at,
+            )
             .await?;
         if completed {
             return decode_operation_result(operation.result);
@@ -535,7 +587,7 @@ impl Service {
 
         let attachment_id = required_entity_id(&operation.entity_ids, "attachmentId")?;
         created_at = operation.created_at;
-        let normalized_file_name = normalize_external_id(&command.original_file_name);
+        let normalized_file_name = normalize_file_name(&command.original_file_name);
         let attachment_object_key = if command.object_key.trim().is_empty() {
             self.key_builder
                 .attachment_object(&attachment_id, created_at, &normalized_file_name)
@@ -621,19 +673,70 @@ impl Service {
         Some(self.idempotency_locks[shard].clone().lock_owned().await)
     }
 
-    fn message_entity_ids(&self, command: &SendMessageCommand) -> Result<HashMap<String, String>> {
+    async fn lock_state_projection(
+        &self,
+        actor_id: &str,
+        target_kind: &str,
+        target_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let mut hasher = DefaultHasher::new();
+        actor_id.hash(&mut hasher);
+        target_kind.hash(&mut hasher);
+        target_id.hash(&mut hasher);
+        let shard = hasher.finish() as usize % self.state_locks.len();
+        self.state_locks[shard].clone().lock_owned().await
+    }
+
+    async fn resolve_message_thread(
+        &self,
+        command: &SendMessageCommand,
+    ) -> Result<MessageThreadContext> {
+        let requested_thread_id = command.thread_id.trim().to_string();
+        let parent_target = command.parent_message_id.trim();
+        if parent_target.is_empty() {
+            return Ok(MessageThreadContext {
+                thread_id: requested_thread_id,
+                parent_message_id: String::new(),
+            });
+        }
+
+        let parent = self.get_message(parent_target).await?;
+        if !requested_thread_id.is_empty()
+            && !parent.thread_id.is_empty()
+            && requested_thread_id != parent.thread_id
+        {
+            return Err(validation_error(
+                "threadId must match the parent message threadId",
+            ));
+        }
+
+        Ok(MessageThreadContext {
+            thread_id: if requested_thread_id.is_empty() {
+                parent.thread_id
+            } else {
+                requested_thread_id
+            },
+            parent_message_id: parent.id,
+        })
+    }
+
+    fn message_entity_ids(
+        &self,
+        command: &SendMessageCommand,
+        resolved_thread_id: &str,
+    ) -> Result<HashMap<String, String>> {
         let mut entity_ids = HashMap::new();
         entity_ids.insert("messageId".to_string(), self.id_generator.new_id()?);
         entity_ids.insert("sentRefId".to_string(), self.id_generator.new_id()?);
         for index in 0..command.recipient_actor_ids.len() {
             entity_ids.insert(format!("inboxRefId:{index}"), self.id_generator.new_id()?);
         }
-        if command.thread_id.is_empty()
+        if resolved_thread_id.is_empty()
             && (command.create_thread || !command.parent_message_id.is_empty())
         {
             entity_ids.insert("threadId".to_string(), self.id_generator.new_id()?);
         }
-        if !command.thread_id.is_empty()
+        if !resolved_thread_id.is_empty()
             || command.create_thread
             || !command.parent_message_id.is_empty()
         {
@@ -646,6 +749,8 @@ impl Service {
         &self,
         caller_id: &str,
         idempotency_key: &str,
+        operation_kind: &str,
+        request_hash: &str,
         entity_ids: HashMap<String, String>,
         created_at: DateTime<Utc>,
     ) -> Result<(OperationRecord, bool)> {
@@ -655,6 +760,8 @@ impl Service {
             id: operation_id,
             caller_id: caller_id.to_string(),
             idempotency_key: idempotency_key.to_string(),
+            operation_kind: operation_kind.to_string(),
+            request_hash: request_hash.to_string(),
             status: "pending".to_string(),
             entity_ids,
             result: None,
@@ -690,6 +797,12 @@ impl Service {
             }
             Err(ServiceError::ObjectAlreadyExists) => {
                 let existing: OperationRecord = self.get_json(&idempotency_object_key).await?;
+                if (!existing.operation_kind.is_empty()
+                    && existing.operation_kind != operation_kind)
+                    || (!existing.request_hash.is_empty() && existing.request_hash != request_hash)
+                {
+                    return Err(ServiceError::IdempotencyConflict);
+                }
                 let completed = existing.status == "completed";
                 Ok((existing, completed))
             }
@@ -1159,6 +1272,60 @@ fn normalized_payload(payload: Option<Value>) -> Value {
     payload.unwrap_or_else(|| json!({}))
 }
 
+fn request_hash(operation_kind: &str, fingerprint: Value) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(operation_kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(serde_json::to_vec(&fingerprint)?);
+    let digest = hasher.finalize();
+    Ok(format!("{digest:x}"))
+}
+
+fn send_message_fingerprint(command: &SendMessageCommand) -> Value {
+    json!({
+        "senderActorId": command.sender_actor_id,
+        "recipientActorIds": command.recipient_actor_ids,
+        "messageType": command.message_type,
+        "payload": command.payload,
+        "attachmentIds": command.attachment_ids,
+        "threadId": command.thread_id,
+        "parentMessageId": command.parent_message_id,
+        "createThread": command.create_thread
+    })
+}
+
+fn send_broadcast_fingerprint(command: &SendBroadcastCommand) -> Value {
+    json!({
+        "senderActorId": command.sender_actor_id,
+        "audienceType": command.audience_type,
+        "audienceKeys": command.audience_keys,
+        "messageType": command.message_type,
+        "payload": command.payload,
+        "attachmentIds": command.attachment_ids,
+        "expiresAt": command.expires_at
+    })
+}
+
+fn mark_read_fingerprint(command: &MarkReadCommand) -> Value {
+    json!({
+        "actorId": command.actor_id,
+        "targetKind": command.target_kind,
+        "targetId": command.target_id,
+        "readPosition": command.read_position,
+        "readAt": command.read_at
+    })
+}
+
+fn create_attachment_fingerprint(command: &CreateAttachmentCommand) -> Value {
+    json!({
+        "objectKey": command.object_key,
+        "originalFileName": command.original_file_name,
+        "contentType": command.content_type,
+        "size": command.size,
+        "checksum": command.checksum
+    })
+}
+
 fn normalize_audience_keys(audience_type: &str, audience_keys: &[String]) -> Vec<String> {
     if audience_type == "all" {
         return vec!["all".to_string()];
@@ -1408,6 +1575,81 @@ mod tests {
 
         assert_eq!(left.message_id, right.message_id);
         assert_eq!(left.thread_id, right.thread_id);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reuse_with_different_request_conflicts() {
+        let fixed_now = Utc.with_ymd_and_hms(2026, 6, 1, 11, 22, 33).unwrap();
+        let (_temp_dir, service) = new_test_service(fixed_now);
+
+        service
+            .send_message(SendMessageCommand {
+                caller_id: "tests".to_string(),
+                idempotency_key: "same-key".to_string(),
+                sender_actor_id: "actor-a".to_string(),
+                recipient_actor_ids: vec!["actor-b".to_string()],
+                message_type: "text".to_string(),
+                payload: Some(json!({"text": "first"})),
+                ..Default::default()
+            })
+            .await
+            .expect("first send");
+
+        let error = service
+            .send_message(SendMessageCommand {
+                caller_id: "tests".to_string(),
+                idempotency_key: "same-key".to_string(),
+                sender_actor_id: "actor-a".to_string(),
+                recipient_actor_ids: vec!["actor-b".to_string()],
+                message_type: "text".to_string(),
+                payload: Some(json!({"text": "different"})),
+                ..Default::default()
+            })
+            .await
+            .expect_err("different request should conflict");
+
+        assert!(matches!(error, ServiceError::IdempotencyConflict));
+    }
+
+    #[tokio::test]
+    async fn reply_inherits_parent_thread_when_thread_id_is_omitted() {
+        let fixed_now = Utc.with_ymd_and_hms(2026, 6, 1, 11, 22, 33).unwrap();
+        let (_temp_dir, service) = new_test_service(fixed_now);
+
+        let root = service
+            .send_message(SendMessageCommand {
+                sender_actor_id: "actor-a".to_string(),
+                recipient_actor_ids: vec!["actor-b".to_string()],
+                message_type: "text".to_string(),
+                payload: Some(json!({"text": "root"})),
+                create_thread: true,
+                ..Default::default()
+            })
+            .await
+            .expect("root send");
+
+        let reply = service
+            .send_message(SendMessageCommand {
+                sender_actor_id: "actor-b".to_string(),
+                recipient_actor_ids: vec!["actor-a".to_string()],
+                message_type: "text".to_string(),
+                payload: Some(json!({"text": "reply"})),
+                parent_message_id: root.message_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .expect("reply send");
+
+        assert_eq!(reply.thread_id, root.thread_id);
+        let reply_message = service.get_message(&reply.message_id).await.expect("reply");
+        assert_eq!(reply_message.thread_id, root.thread_id);
+        assert_eq!(reply_message.parent_message_id, root.message_id);
+
+        let thread = service
+            .list_thread(&root.thread_id, "actor-a", "", 10)
+            .await
+            .expect("thread");
+        assert_eq!(thread.items.len(), 2);
     }
 
     fn new_test_service(now: DateTime<Utc>) -> (tempfile::TempDir, Service) {

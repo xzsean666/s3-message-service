@@ -185,6 +185,13 @@ fn error_response(error: ServiceError) -> Response {
                 message: "object already exists".to_string(),
             },
         ),
+        ServiceError::IdempotencyConflict => json_response(
+            StatusCode::CONFLICT,
+            ErrorBody {
+                error: "idempotency_conflict".to_string(),
+                message: "idempotency key was reused with a different request".to_string(),
+            },
+        ),
         ServiceError::InvalidObjectKey => json_response(
             StatusCode::BAD_REQUEST,
             ErrorBody {

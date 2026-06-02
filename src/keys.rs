@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
 const MAX_TIMESTAMP_MILLIS: i64 = 9_999_999_999_999_999;
+const MAX_NORMALIZED_SEGMENT_BYTES: usize = 96;
+const HASH_SUFFIX_BYTES: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyBuilder {
@@ -49,7 +51,7 @@ impl KeyBuilder {
             "attachments/objects/{}/{}/{}",
             time_prefix(created_at),
             attachment_id,
-            normalize_external_id(normalized_file_name)
+            normalize_file_name(normalized_file_name)
         ))
     }
 
@@ -247,9 +249,37 @@ pub fn normalize_external_id(raw: &str) -> String {
         return format!("empty-{}", short_hash(raw));
     }
 
+    let normalized = sanitize_key_segment(trimmed, "id");
+    let lossy = normalized != trimmed || normalized.len() > MAX_NORMALIZED_SEGMENT_BYTES;
+    if lossy {
+        with_hash_suffix(&normalized, trimmed)
+    } else {
+        normalized
+    }
+}
+
+pub fn normalize_file_name(raw: &str) -> String {
+    let normalized = sanitize_key_segment(raw.trim(), "file");
+    if normalized.len() > MAX_NORMALIZED_SEGMENT_BYTES {
+        with_hash_suffix(&normalized, raw.trim())
+    } else {
+        normalized
+    }
+}
+
+fn normalize_namespace(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        normalize_file_name(trimmed)
+    }
+}
+
+fn sanitize_key_segment(raw: &str, fallback: &str) -> String {
     let mut normalized = String::new();
     let mut previous_dash = false;
-    for character in trimmed.chars() {
+    for character in raw.chars() {
         for lowered in character.to_lowercase() {
             let valid = lowered.is_alphanumeric() || matches!(lowered, '-' | '_' | '.');
             if valid {
@@ -263,25 +293,34 @@ pub fn normalize_external_id(raw: &str) -> String {
     }
 
     let normalized = normalized.trim_matches(['-', '.']).to_string();
-    let mut normalized = if normalized.is_empty() {
-        "id".to_string()
+    if normalized.is_empty() {
+        fallback.to_string()
     } else {
         normalized
-    };
-    if normalized.len() > 96 {
-        let prefix: String = normalized.chars().take(72).collect();
-        normalized = format!("{}-{}", prefix, short_hash(trimmed));
     }
-    normalized
 }
 
-fn normalize_namespace(raw: &str) -> String {
-    let trimmed = raw.trim().trim_matches('/');
-    if trimmed.is_empty() {
-        String::new()
-    } else {
-        normalize_external_id(trimmed)
+fn with_hash_suffix(normalized: &str, raw: &str) -> String {
+    let hash = short_hash(raw);
+    let max_prefix_bytes = MAX_NORMALIZED_SEGMENT_BYTES - HASH_SUFFIX_BYTES - 1;
+    let prefix = truncate_to_boundary(normalized, max_prefix_bytes).trim_matches(['-', '.']);
+    let prefix = if prefix.is_empty() { "id" } else { prefix };
+    format!("{prefix}-{hash}")
+}
+
+fn truncate_to_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
     }
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
 }
 
 fn short_hash(value: &str) -> String {
@@ -299,8 +338,11 @@ mod tests {
 
     #[test]
     fn normalize_external_identifier() {
-        assert_eq!(normalize_external_id(" User/ABC 01 "), "user-abc-01");
+        assert_eq!(normalize_external_id("actor-a"), "actor-a");
         assert!(!normalize_external_id("a/b").contains('/'));
+        assert_ne!(normalize_external_id("a/b"), normalize_external_id("a b"));
+        assert_ne!(normalize_external_id("User"), normalize_external_id("user"));
+        assert_eq!(normalize_file_name("Report Final.pdf"), "report-final.pdf");
     }
 
     #[test]

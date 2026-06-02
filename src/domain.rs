@@ -112,6 +112,10 @@ pub struct OperationRecord {
     pub id: String,
     pub caller_id: String,
     pub idempotency_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation_kind: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_hash: String,
     pub status: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub entity_ids: HashMap<String, String>,

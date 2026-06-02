@@ -8,6 +8,8 @@ pub enum ServiceError {
     Validation(String),
     #[error("invalid cursor")]
     InvalidCursor,
+    #[error("idempotency key was reused with a different request")]
+    IdempotencyConflict,
     #[error("object already exists")]
     ObjectAlreadyExists,
     #[error("object not found")]
